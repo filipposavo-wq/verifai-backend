@@ -1,3 +1,4 @@
+const path = require('path');
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -5,6 +6,13 @@ require('dotenv').config();
 
 const app = express();
 app.use(cors());
+
+// Pagine statiche: serve l'informativa privacy su /privacy.html.
+// Apple richiede un URL pubblico e raggiungibile per ogni app con annunci.
+app.use(express.static(path.join(__dirname, 'public')));
+app.get('/privacy', (req, res) =>
+  res.sendFile(path.join(__dirname, 'public', 'privacy.html')),
+);
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 

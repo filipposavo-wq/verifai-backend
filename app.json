@@ -1,0 +1,18 @@
+{
+  "expo": {
+    "extra": {
+      "eas": {
+        "projectId": "e21fad21-3adf-400e-8085-8289204980d7"
+      }
+    },
+    "android": {
+      "package": "com.filipposavone.verifaibackend"
+    },
+    "ios": {
+      "bundleIdentifier": "com.filipposavone.verifaibackend",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
+    }
+  }
+}
