@@ -13,6 +13,12 @@ app.use(express.static(path.join(__dirname, 'public')));
 app.get('/privacy', (req, res) =>
   res.sendFile(path.join(__dirname, 'public', 'privacy.html')),
 );
+app.get('/supporto', (req, res) =>
+  res.sendFile(path.join(__dirname, 'public', 'supporto.html')),
+);
+app.get('/support', (req, res) =>
+  res.sendFile(path.join(__dirname, 'public', 'supporto.html')),
+);
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
