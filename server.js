@@ -1,14 +1,15 @@
 const path = require('path');
+const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
+const FormData = require('form-data');
 require('dotenv').config();
 
 const app = express();
 app.use(cors());
 
-// Pagine statiche: serve l'informativa privacy su /privacy.html.
-// Apple richiede un URL pubblico e raggiungibile per ogni app con annunci.
+// Pagine statiche: informativa privacy e supporto.
 app.use(express.static(path.join(__dirname, 'public')));
 app.get('/privacy', (req, res) =>
   res.sendFile(path.join(__dirname, 'public', 'privacy.html')),
@@ -19,64 +20,108 @@ app.get('/supporto', (req, res) =>
 app.get('/support', (req, res) =>
   res.sendFile(path.join(__dirname, 'public', 'supporto.html')),
 );
+
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-const HF_API_KEY = process.env.HF_API_KEY;
+const SIGHTENGINE_USER = process.env.SIGHTENGINE_USER;
+const SIGHTENGINE_SECRET = process.env.SIGHTENGINE_SECRET;
+const SIGHTENGINE_URL = 'https://api.sightengine.com/1.0/check.json';
 
-const MODELS = [
-  { id: 'Organika/sdxl-detector', aiLabel: 'artificial' },
-  { id: 'umm-maybe/AI-image-detector', aiLabel: 'artificial' },
-  { id: 'saltacc/anime-ai-detect', aiLabel: 'ai' },
-];
-
-// Log di ogni richiesta: senza, sui log di Railway non si capisce
-// se il problema e' che le richieste non arrivano o che falliscono dentro.
 app.use((req, res, next) => {
   console.log(`${new Date().toISOString()}  ${req.method} ${req.path}`);
   next();
 });
 
 /**
- * Rotte di stato.
- * Servono per verificare da browser che il server sia vivo, e permettono
- * a Railway di fare l'healthcheck. Senza una rotta su "/", Express
- * risponde 404 e ogni controllo sembra un errore.
+ * Cache dei risultati, per hash del contenuto dell'immagine.
+ *
+ * Le immagini virali vengono analizzate da migliaia di persone diverse: senza
+ * cache pagheresti la stessa analisi ogni volta. Con la cache la seconda
+ * richiesta della stessa immagine costa zero operazioni.
+ *
+ * È in memoria, quindi si azzera a ogni deploy o riavvio del servizio. Va bene
+ * per i volumi attuali; se un domani servisse persistenza, la sostituzione
+ * naturale è Redis, che Railway offre come servizio aggiuntivo.
  */
+const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 giorni
+const CACHE_MAX_ENTRIES = 5000;
+const cache = new Map();
+
+function cacheGet(hash) {
+  const hit = cache.get(hash);
+  if (!hit) return null;
+  if (Date.now() - hit.at > CACHE_TTL_MS) {
+    cache.delete(hash);
+    return null;
+  }
+  return hit.aiScore;
+}
+
+function cacheSet(hash, aiScore) {
+  // Map conserva l'ordine di inserimento: la prima chiave è la più vecchia.
+  if (cache.size >= CACHE_MAX_ENTRIES) {
+    cache.delete(cache.keys().next().value);
+  }
+  cache.set(hash, { aiScore, at: Date.now() });
+}
+
 app.get('/', (req, res) => {
   res.json({
     service: 'verifai-backend',
     status: 'online',
-    hasApiKey: Boolean(HF_API_KEY),
-    models: MODELS.map((m) => m.id),
+    detector: 'sightengine/genai',
+    hasCredentials: Boolean(SIGHTENGINE_USER && SIGHTENGINE_SECRET),
+    cacheSize: cache.size,
     time: new Date().toISOString(),
   });
 });
 
 app.get('/health', (req, res) => res.json({ ok: true }));
 
-async function queryModel(modelId, imageBuffer) {
-  const response = await axios.post(
-    'https://router.huggingface.co/hf-inference/models/' + modelId,
-    imageBuffer,
-    {
-      headers: {
-        Authorization: 'Bearer ' + HF_API_KEY,
-        'Content-Type': 'application/octet-stream',
-      },
-      timeout: 20000,
-    },
-  );
-  return response.data;
+/**
+ * Interroga Sightengine con il modello `genai`.
+ * Restituisce la probabilità 0-1 che l'immagine sia generata o modificata con AI.
+ */
+async function detectAi(imageBuffer) {
+  const form = new FormData();
+  form.append('media', imageBuffer, {
+    filename: 'image.jpg',
+    contentType: 'image/jpeg',
+  });
+  form.append('models', 'genai');
+  form.append('api_user', SIGHTENGINE_USER);
+  form.append('api_secret', SIGHTENGINE_SECRET);
+
+  const response = await axios.post(SIGHTENGINE_URL, form, {
+    headers: form.getHeaders(),
+    timeout: 25000,
+    maxBodyLength: Infinity,
+  });
+
+  const data = response.data;
+
+  if (data.status !== 'success') {
+    throw new Error(
+      `Sightengine: ${data.error?.message ?? JSON.stringify(data).slice(0, 200)}`,
+    );
+  }
+
+  const score = data.type?.ai_generated;
+  if (typeof score !== 'number') {
+    throw new Error('Sightengine: punteggio ai_generated assente nella risposta');
+  }
+
+  return score;
 }
 
 app.post('/api/check-photo', async (req, res) => {
   try {
-    if (!HF_API_KEY) {
-      console.error('HF_API_KEY non impostata: nessun modello puo rispondere.');
+    if (!SIGHTENGINE_USER || !SIGHTENGINE_SECRET) {
+      console.error('Credenziali Sightengine mancanti nelle variabili d ambiente.');
       return res.status(500).json({
         success: false,
-        error: 'Configurazione del server incompleta (chiave API mancante).',
+        error: 'Configurazione del server incompleta.',
       });
     }
 
@@ -87,95 +132,80 @@ app.post('/api/check-photo', async (req, res) => {
 
     const cleanBase64 = base64Image.replace(/^data:image\/\w+;base64,/, '');
     const imageBuffer = Buffer.from(cleanBase64, 'base64');
-    console.log(`Immagine ricevuta: ${(imageBuffer.length / 1024).toFixed(0)} KB`);
 
-    const votes = [];
-    const scores = [];
-    const failures = [];
-
-    for (const model of MODELS) {
-      try {
-        const result = await queryModel(model.id, imageBuffer);
-
-        if (!Array.isArray(result)) {
-          failures.push(`${model.id}: risposta inattesa ${JSON.stringify(result).slice(0, 120)}`);
-          continue;
-        }
-
-        const aiEntry = result.find((item) =>
-          item.label?.toLowerCase().includes(model.aiLabel),
-        );
-
-        if (!aiEntry) {
-          failures.push(`${model.id}: etichetta "${model.aiLabel}" non trovata`);
-          continue;
-        }
-
-        scores.push(aiEntry.score);
-        votes.push(aiEntry.score > 0.5);
-        console.log(
-          `${model.id}: ${(aiEntry.score * 100).toFixed(1)}% -> ${aiEntry.score > 0.5 ? 'AI' : 'REALE'}`,
-        );
-      } catch (err) {
-        // Il messaggio di HuggingFace e' la parte utile: 401 chiave errata,
-        // 404 modello rimosso, 503 modello in caricamento.
-        const detail = err.response
-          ? `HTTP ${err.response.status} ${JSON.stringify(err.response.data).slice(0, 200)}`
-          : err.message;
-        failures.push(`${model.id}: ${detail}`);
-        console.log(`Modello ${model.id} fallito -> ${detail}`);
-      }
+    if (imageBuffer.length < 1024) {
+      return res.status(400).json({ success: false, error: 'Immagine non valida' });
     }
 
-    if (votes.length === 0) {
-      console.error('Nessun modello ha risposto. Dettagli:', failures);
-      return res.status(502).json({
-        success: false,
-        error: 'Nessun modello di analisi ha risposto.',
-        details: failures,
+    const hash = crypto.createHash('sha256').update(imageBuffer).digest('hex');
+
+    const cached = cacheGet(hash);
+    if (cached !== null) {
+      console.log(
+        `cache HIT  ${hash.slice(0, 12)}  ${(cached * 100).toFixed(1)}%  (0 operazioni)`,
+      );
+      return res.json({
+        success: true,
+        aiScore: cached,
+        isAI: cached > 0.5,
+        cached: true,
       });
     }
 
-    const votesAI = votes.filter(Boolean).length;
-    const aiScore = scores.reduce((a, b) => a + b, 0) / scores.length;
-    const isAI = votesAI > votes.length - votesAI;
+    console.log(
+      `cache MISS ${hash.slice(0, 12)}  ${(imageBuffer.length / 1024).toFixed(0)} KB → Sightengine`,
+    );
+
+    const aiScore = await detectAi(imageBuffer);
+    cacheSet(hash, aiScore);
 
     console.log(
-      `Modelli utili: ${votes.length}/${MODELS.length} | media ${(aiScore * 100).toFixed(1)}% | esito ${isAI ? 'AI' : 'REALE'}`,
+      `risultato  ${hash.slice(0, 12)}  ${(aiScore * 100).toFixed(1)}% → ${aiScore > 0.5 ? 'AI' : 'REALE'}`,
     );
 
     return res.json({
       success: true,
       aiScore,
-      isAI,
-      modelsUsed: votes.length,
+      isAI: aiScore > 0.5,
+      cached: false,
     });
   } catch (error) {
-    console.error('Errore interno:', error);
-    return res.status(500).json({
+    // Il messaggio di Sightengine è la parte utile: 401 credenziali errate,
+    // 429 quota esaurita, 400 immagine non supportata.
+    const detail = error.response
+      ? `HTTP ${error.response.status} ${JSON.stringify(error.response.data).slice(0, 200)}`
+      : error.message;
+
+    console.error('Analisi fallita:', detail);
+
+    const quotaExhausted =
+      error.response?.status === 429 ||
+      /usage limit|quota/i.test(JSON.stringify(error.response?.data ?? ''));
+
+    return res.status(quotaExhausted ? 429 : 502).json({
       success: false,
-      error: 'Errore interno del server',
-      details: error.message,
+      error: quotaExhausted
+        ? 'Il servizio di analisi ha raggiunto il limite giornaliero. Riprova domani.'
+        : 'Analisi non riuscita. Riprova fra poco.',
+      details: detail,
     });
   }
 });
 
 const PORT = process.env.PORT || 3000;
 
-// '0.0.0.0' e' obbligatorio su Railway: se il processo ascolta solo su
-// localhost, il router esterno non lo raggiunge e la risposta e' 502
-// "Application failed to respond", esattamente il sintomo osservato.
+// '0.0.0.0' è obbligatorio su Railway: senza, il router esterno non raggiunge
+// il processo e la risposta è 502 "Application failed to respond".
 app.listen(PORT, '0.0.0.0', () => {
   console.log('==================================================');
   console.log(`  verifai-backend avviato sulla porta ${PORT}`);
-  console.log(`  Chiave HuggingFace presente: ${HF_API_KEY ? 'si' : 'NO'}`);
+  console.log(`  Rilevatore: Sightengine (modello genai)`);
+  console.log(
+    `  Credenziali presenti: ${SIGHTENGINE_USER && SIGHTENGINE_SECRET ? 'si' : 'NO'}`,
+  );
   console.log(`  Node ${process.version}`);
   console.log('==================================================');
 });
 
-process.on('unhandledRejection', (reason) => {
-  console.error('Promise non gestita:', reason);
-});
-process.on('uncaughtException', (error) => {
-  console.error('Eccezione non gestita:', error);
-});
+process.on('unhandledRejection', (reason) => console.error('Promise non gestita:', reason));
+process.on('uncaughtException', (error) => console.error('Eccezione non gestita:', error));
