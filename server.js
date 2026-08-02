@@ -21,6 +21,17 @@ app.get('/support', (req, res) =>
   res.sendFile(path.join(__dirname, 'public', 'supporto.html')),
 );
 
+/**
+ * app-ads.txt — standard IAB che dichiara chi è autorizzato a vendere gli
+ * spazi pubblicitari di questa app. Google lo cerca all'indirizzo indicato
+ * come "sito web dello sviluppatore" nella scheda App Store.
+ * Deve essere servito come testo semplice, non come HTML.
+ */
+app.get('/app-ads.txt', (req, res) => {
+  res.type('text/plain');
+  res.sendFile(path.join(__dirname, 'public', 'app-ads.txt'));
+});
+
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
